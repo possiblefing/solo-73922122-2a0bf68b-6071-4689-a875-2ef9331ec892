@@ -1,0 +1,64 @@
+# Two API instances (each serving FastAPI and running one background worker),
+# one PostgreSQL, and a round-robin load balancer in front of the APIs.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fabpass}
+      POSTGRES_DB: ${POSTGRES_DB:-fab}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fab} -d ${POSTGRES_DB:-fab}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api1:
+    build: .
+    environment:
+      INSTANCE_ID: api1
+      POSTGRES_HOST: db
+      POSTGRES_USER: ${POSTGRES_USER:-fab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fabpass}
+      POSTGRES_DB: ${POSTGRES_DB:-fab}
+      STORAGE_DIR: /data/raw
+      SLOW_MARKER_FILE: /data/raw/slow_batches.txt
+    volumes:
+      - rawdata:/data/raw
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api2:
+    build: .
+    environment:
+      INSTANCE_ID: api2
+      POSTGRES_HOST: db
+      POSTGRES_USER: ${POSTGRES_USER:-fab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fabpass}
+      POSTGRES_DB: ${POSTGRES_DB:-fab}
+      STORAGE_DIR: /data/raw
+      SLOW_MARKER_FILE: /data/raw/slow_batches.txt
+    volumes:
+      - rawdata:/data/raw
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api1
+      - api2
+
+volumes:
+  pgdata:
+  rawdata:
