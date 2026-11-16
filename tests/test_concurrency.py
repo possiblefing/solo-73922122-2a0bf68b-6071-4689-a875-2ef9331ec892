@@ -44,7 +44,7 @@ async def test_slow_head_batch_blocks_same_device_only(tmp_path, monkeypatch):
     pool = await create_pool()
     try:
         async with pool.acquire() as conn:
-            await conn.execute("TRUNCATE wafer_measurements, batches, device_state")
+            await conn.execute("TRUNCATE wafer_measurements, batches, device_state, delivery_outbox")
             await conn.execute("ALTER SEQUENCE batches_id_seq RESTART WITH 1")
 
         # Same device EQ-F: head batch F1 will be slow; F2..F4 must wait.
@@ -119,7 +119,7 @@ async def test_two_workers_never_double_decide(tmp_path, monkeypatch):
     pool = await create_pool()
     try:
         async with pool.acquire() as conn:
-            await conn.execute("TRUNCATE wafer_measurements, batches, device_state")
+            await conn.execute("TRUNCATE wafer_measurements, batches, device_state, delivery_outbox")
             await conn.execute("ALTER SEQUENCE batches_id_seq RESTART WITH 1")
         ids = []
         for i in range(1, 9):

@@ -40,10 +40,42 @@ class Settings:
     baseline_count: int = 3          # first N accepted batches per device are released
     reference_count: int = 3         # compare against the N most recent released batches
     drift_threshold_nm: float = 5.0  # strictly greater than this => quarantine
+    # Delivery to the independent analysis database.  An empty receiver URL
+    # disables the feature entirely (no outbox worker, no network calls).
+    delivery_receiver_url: str = os.environ.get("DELIVERY_RECEIVER_URL", "").rstrip("/")
+    delivery_token: str = os.environ.get("DELIVERY_TOKEN", "")
+    delivery_poll_seconds: float = float(os.environ.get("DELIVERY_POLL_SECONDS", "1.0"))
+    delivery_timeout_seconds: float = float(
+        os.environ.get("DELIVERY_TIMEOUT_SECONDS", "10"))
+    delivery_lease_seconds: float = float(os.environ.get("DELIVERY_LEASE_SECONDS", "30"))
+    delivery_retry_base_seconds: float = float(
+        os.environ.get("DELIVERY_RETRY_BASE_SECONDS", "1.0"))
+    delivery_retry_max_seconds: float = float(
+        os.environ.get("DELIVERY_RETRY_MAX_SECONDS", "60"))
+    delivery_reconcile_limit: int = int(
+        os.environ.get("DELIVERY_RECONCILE_LIMIT", "200"))
+
+    @property
+    def delivery_enabled(self) -> bool:
+        return bool(self.delivery_receiver_url)
 
     @property
     def crash_marker_file(self) -> str:
         return os.path.join(os.path.dirname(self.slow_marker_file), "crash_batches.txt")
+
+    # Delivery demo hooks (same convention as the decision-worker markers:
+    # absent file => feature disabled).
+    @property
+    def delivery_slow_marker_file(self) -> str:
+        return os.path.join(os.path.dirname(self.slow_marker_file),
+                            "delivery_slow_batches.txt")
+
+    @property
+    def delivery_crash_marker_file(self) -> str:
+        """Batch numbers for which the source hard-exits *after* the receiver
+        accepted the batch but *before* the receipt is recorded locally."""
+        return os.path.join(os.path.dirname(self.slow_marker_file),
+                            "delivery_crash_batches.txt")
 
 
 settings = Settings()

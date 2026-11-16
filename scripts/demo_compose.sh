@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Demonstration against the real docker-compose stack (db + two API instances
-# behind nginx on :8080).
+# Demonstration against the real docker-compose stack:
+#   db + analysis-db + receiver + two API instances behind nginx on :8080.
 #
 #   bash scripts/demo_compose.sh
 #
@@ -11,10 +11,18 @@
 #   3. slow head-of-line batch: same-device FIFO, other devices unaffected;
 #   4. container crash: `docker stop`-like failure mid-batch, survivor takes
 #      over with no half batch and no double reference advancement;
-#   5. the data endpoint serves released batches only.
+#   5. the data endpoint serves released batches only;
+#   6. delivery of released batches to the independent receiver: full detail,
+#      decision and reference batch numbers, per-batch query, quarantined
+#      batches never shipped;
+#   7. receiver outage: retries automatically, verdict unchanged, no false
+#      "delivered"; source hard-exit after the receiver accepted but before
+#      the receipt was recorded -> survivor reuses the same receipt.
 set -euo pipefail
 
 BASE="${BASE:-http://localhost:8080}"
+# The receiver is reachable through nginx at /analysis and directly on :8081.
+RECEIVER="${RECEIVER:-http://localhost:8081}"
 DEV="EQ-DEMO-$$"
 j() { python3 -c "import sys,json;d=json.load(sys.stdin);print(json.dumps(d,ensure_ascii=False,indent=2))"; }
 
@@ -27,11 +35,11 @@ post() { # $1=batch $2=device $3=file
   curl -sS -w '\n%{http_code}\n' -X POST "$BASE/batches" \
     -F "batch_no=$1" -F "device_id=$2" -F "file=@$3;type=text/csv"
 }
-status_of() { curl -sS "$BASE/batches/$1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])'; }
+status_of() { curl -sS --max-time 3 "$BASE/batches/$1" 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])' 2>/dev/null || echo "UNAVAILABLE"; }
 wait_decided() { # $1=batch
   for _ in $(seq 1 100); do
     s=$(status_of "$1")
-    [ "$s" != "PENDING" ] && { echo "$s"; return; }
+    [ "$s" != "PENDING" ] && [ "$s" != "UNAVAILABLE" ] && { echo "$s"; return; }
     sleep 0.3
   done
   echo "TIMEOUT"; exit 1
@@ -103,5 +111,80 @@ curl -sS "$BASE/batches/CRASH-4" | j
 
 echo; echo "== 6. data lake endpoint hides quarantined batches =="
 curl -sS "$BASE/data/released?device_id=$DEV" | j | grep -E 'total_released|batch_no'
-echo
-echo "OpenAPI docs: $BASE/docs"
+
+echo; echo "== 7. delivery to the independent analysis receiver =="
+for n in 1 2 3 4; do
+  csv "DEL$n" $([ "$n" = 4 ] && echo 504 || echo 500) 5 > "/tmp/del$n.csv"
+  post "${DEV}-DEL-$n" "${DEV}-DEL" "/tmp/del$n.csv" >/dev/null
+done
+csv DELQ 900 5 > /tmp/delq.csv
+post "${DEV}-DEL-Q" "${DEV}-DEL" /tmp/delq.csv >/dev/null
+for n in 1 2 3 4 Q; do echo "  ${DEV}-DEL-$n -> $(wait_decided "${DEV}-DEL-$n")"; done
+delivery_status() { curl -sS "$BASE/deliveries/$1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["delivery_status"])'; }
+wait_delivered() { # $1=batch
+  for _ in $(seq 1 200); do
+    s=$(delivery_status "$1"); [ "$s" = "DELIVERED" ] && { echo "$s"; return; }
+    sleep 0.3
+  done
+  echo "TIMEOUT-$s"; exit 1
+}
+for n in 1 2 3 4; do echo "  ${DEV}-DEL-$n delivery -> $(wait_delivered "${DEV}-DEL-$n")"; done
+echo "  ${DEV}-DEL-Q delivery -> $(delivery_status "${DEV}-DEL-Q") (quarantined, never shipped)"
+echo "  source receipt/status for the post-baseline batch ${DEV}-DEL-4:"
+curl -sS "$BASE/deliveries/${DEV}-DEL-4" | j | grep -E 'delivery_status|receipt_id|published|content_sha256'
+echo "  receiver per-batch detail for ${DEV}-DEL-4:"
+curl -sS "$RECEIVER/analysis/batches/${DEV}-DEL-4" | j | grep -E 'batch_no|status|reference_batch_nos|median_nm|wafers'
+echo "  quarantined batch on the receiver (expect 404): $(curl -sS -o /dev/null -w '%{http_code}' "$RECEIVER/analysis/batches/${DEV}-DEL-Q")"
+
+echo; echo "== 8. receiver outage: retry, no verdict change, no false delivered =="
+docker compose stop receiver >/dev/null
+csv RX 500 5 > /tmp/rx.csv
+post "${DEV}-RETRY-1" "${DEV}-RETRY" /tmp/rx.csv >/dev/null
+echo "  ${DEV}-RETRY-1 -> $(wait_decided "${DEV}-RETRY-1")"
+sleep 2
+echo "  delivery while receiver down: $(delivery_status "${DEV}-RETRY-1")"
+curl -sS "$BASE/batches/${DEV}-RETRY-1" | grep -o '"status":"[A-Z]*"' | head -1
+docker compose start receiver >/dev/null
+for i in $(seq 1 60); do
+  [ "$(curl -sS -o /dev/null -w '%{http_code}' "$RECEIVER/health" 2>/dev/null)" = "200" ] && break
+  sleep 0.5
+done
+echo "  after receiver restart -> $(wait_delivered "${DEV}-RETRY-1") (automatic retry)"
+
+echo; echo "== 9. source crash AFTER receiver accept, BEFORE receipt recorded =="
+csv RY 500 5 > /tmp/ry.csv
+# Mark the batch BEFORE submitting it: whichever API instance ships it will
+# hard-exit right after the receiver accepted it.  Compose restarts that
+# container; we stop the pair as soon as the crash is observed to avoid a
+# restart loop, clear the marker, then let the survivor retry.
+docker compose exec -T api1 sh -c "echo '${DEV}-CRASH-DEL-1' > /data/raw/delivery_crash_batches.txt"
+post "${DEV}-CRASH-DEL-1" "${DEV}-CRASH-DEL" /tmp/ry.csv >/dev/null
+echo "  ${DEV}-CRASH-DEL-1 -> $(wait_decided ${DEV}-CRASH-DEL-1)"
+CRASH_SEEN=0
+for _ in $(seq 1 160); do
+  if docker compose logs api1 api2 2>/dev/null | grep -q "CRASH demo: exiting after receiver accepted ${DEV}-CRASH-DEL-1"; then
+    CRASH_SEEN=1
+    break
+  fi
+  sleep 0.25
+done
+docker compose stop api1 api2 >/dev/null 2>&1 || true
+[ "$CRASH_SEEN" = "1" ] && echo "  observed: source hard-exited after receiver accept" \
+  || echo "  WARNING: crash hook not observed"
+docker compose logs api1 api2 2>/dev/null | grep "CRASH demo" | tail -1 || true
+docker compose run --rm -T api1 sh -c 'rm -f /data/raw/delivery_crash_batches.txt'
+echo "  receiver accepted ${DEV}-CRASH-DEL-1 (200): $(curl -sS -o /dev/null -w '%{http_code}' "$RECEIVER/analysis/batches/${DEV}-CRASH-DEL-1")"
+RID=$(curl -sS "$RECEIVER/analysis/batches/${DEV}-CRASH-DEL-1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["receipt"]["receipt_id"])')
+docker compose start api1 api2 >/dev/null
+for i in $(seq 1 120); do
+  [ "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/health" 2>/dev/null)" = "200" ] && break
+  sleep 0.5
+done
+echo "  survivor delivery -> $(wait_delivered ${DEV}-CRASH-DEL-1) (retried after lease)"
+curl -sS "$BASE/deliveries/${DEV}-CRASH-DEL-1" | j | grep -E 'delivery_status|receipt_id|attempts'
+SID=$(curl -sS "$BASE/deliveries/${DEV}-CRASH-DEL-1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["receipt"]["receipt_id"])')
+[ "$RID" = "$SID" ] && echo "  PASS: same receipt $RID reused, no duplicate"
+echo "  receiver row count for this device: $(curl -sS "$RECEIVER/analysis/batches?device_id=${DEV}-CRASH-DEL&published_only=false" | python3 -c 'import sys,json;print(json.load(sys.stdin)["total"])')"
+
+echo; echo "OpenAPI docs: source $BASE/docs | receiver $RECEIVER/docs"
+echo "Receiver is also proxied at $BASE/analysis/ (e.g. $BASE/analysis/batches)"

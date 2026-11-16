@@ -1,5 +1,10 @@
-# Two API instances (each serving FastAPI and running one background worker),
-# one PostgreSQL, and a round-robin load balancer in front of the APIs.
+# Two source API instances (each serving FastAPI and running one decision
+# worker plus one delivery worker), a round-robin load balancer, the
+# independent analysis receiver and its own PostgreSQL.
+#
+#   source PostgreSQL  -> db            (service DB, never exposed)
+#   analysis PostgreSQL -> analysis-db  (independent receiver DB)
+#
 services:
   db:
     image: postgres:16-alpine
@@ -15,9 +20,40 @@ services:
       timeout: 3s
       retries: 20
 
+  analysis-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${ANALYSIS_PG_USER:-analysis}
+      POSTGRES_PASSWORD: ${ANALYSIS_PG_PASSWORD:-analysispass}
+      POSTGRES_DB: ${ANALYSIS_PG_DB:-analysis}
+    volumes:
+      - analysisdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ANALYSIS_PG_USER:-analysis} -d ${ANALYSIS_PG_DB:-analysis}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  receiver:
+    build: .
+    command: ["uvicorn", "receiver.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      ANALYSIS_INSTANCE_ID: receiver
+      ANALYSIS_PG_HOST: analysis-db
+      ANALYSIS_PG_USER: ${ANALYSIS_PG_USER:-analysis}
+      ANALYSIS_PG_PASSWORD: ${ANALYSIS_PG_PASSWORD:-analysispass}
+      ANALYSIS_PG_DB: ${ANALYSIS_PG_DB:-analysis}
+      DELIVERY_TOKEN: ${DELIVERY_TOKEN:-}
+    ports:
+      - "8081:8000"
+    depends_on:
+      analysis-db:
+        condition: service_healthy
+    restart: unless-stopped
+
   api1:
     build: .
-    environment:
+    environment: &api-env
       INSTANCE_ID: api1
       POSTGRES_HOST: db
       POSTGRES_USER: ${POSTGRES_USER:-fab}
@@ -25,28 +61,33 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-fab}
       STORAGE_DIR: /data/raw
       SLOW_MARKER_FILE: /data/raw/slow_batches.txt
+      DELIVERY_RECEIVER_URL: http://receiver:8000
+      DELIVERY_TOKEN: ${DELIVERY_TOKEN:-}
+      DELIVERY_POLL_SECONDS: ${DELIVERY_POLL_SECONDS:-1.0}
+      # Must exceed DELIVERY_TIMEOUT_SECONDS (10s) so a slow but healthy
+      # call is never duplicated; a crashed sender is recovered after expiry.
+      DELIVERY_LEASE_SECONDS: ${DELIVERY_LEASE_SECONDS:-12}
     volumes:
       - rawdata:/data/raw
     depends_on:
       db:
         condition: service_healthy
+      receiver:
+        condition: service_started
     restart: unless-stopped
 
   api2:
     build: .
     environment:
+      <<: *api-env
       INSTANCE_ID: api2
-      POSTGRES_HOST: db
-      POSTGRES_USER: ${POSTGRES_USER:-fab}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fabpass}
-      POSTGRES_DB: ${POSTGRES_DB:-fab}
-      STORAGE_DIR: /data/raw
-      SLOW_MARKER_FILE: /data/raw/slow_batches.txt
     volumes:
       - rawdata:/data/raw
     depends_on:
       db:
         condition: service_healthy
+      receiver:
+        condition: service_started
     restart: unless-stopped
 
   nginx:
@@ -58,7 +99,9 @@ services:
     depends_on:
       - api1
       - api2
+      - receiver
 
 volumes:
   pgdata:
   rawdata:
+  analysisdata:

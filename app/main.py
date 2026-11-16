@@ -15,6 +15,12 @@ from fastapi.responses import JSONResponse
 from .config import settings
 from .csvutil import CsvValidationError, parse_thickness_csv
 from .db import close_pool, create_pool
+from .delivery import (
+    DeliveryWorker,
+    get_delivery_status,
+    list_deliveries,
+    reconcile,
+)
 from .service import (
     ConflictError,
     accept_submission,
@@ -39,9 +45,13 @@ async def lifespan(app: FastAPI):
     worker = DecisionWorker(pool, settings.instance_id)
     worker.start()
     app.state.worker = worker
+    delivery = DeliveryWorker(pool, settings.instance_id)
+    delivery.start()
+    app.state.delivery_worker = delivery
     try:
         yield
     finally:
+        await delivery.stop()
         await worker.stop()
         await close_pool()
 
@@ -150,6 +160,39 @@ async def released_data(
     return {"total_released": total, "limit": limit, "offset": offset, "items": items}
 
 
+# ------------------------------------------------------------------ delivery
+@app.get("/deliveries/{batch_no}",
+         summary="逐批投递状态与回执（隔离批不投递）")
+async def delivery_status(batch_no: str):
+    status_doc = await get_delivery_status(get_pool_safe(), batch_no)
+    if status_doc is None:
+        raise HTTPException(404, f"批号不存在 / batch not found: {batch_no}")
+    return status_doc
+
+
+@app.get("/deliveries", summary="列出投递任务的逐批状态")
+async def deliveries(
+    status: Optional[str] = Query(
+        None, pattern="^(PENDING|IN_FLIGHT|DELIVERED|REJECTED)$"),
+    device_id: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    total, items = await list_deliveries(
+        get_pool_safe(), status_filter=status, device_id=device_id,
+        limit=limit, offset=offset)
+    return {"total": total, "limit": limit, "offset": offset, "items": items,
+            "receiver_configured": settings.delivery_enabled}
+
+
+@app.post("/deliveries/reconcile", status_code=status.HTTP_202_ACCEPTED,
+          summary="立即回填漏建的投递任务（含上线前已放行批次）")
+async def reconcile_deliveries():
+    created = await reconcile(get_pool_safe())
+    return {"created": created,
+            "message": "已为未登记的放行批创建投递任务 / backfilled"}
+
+
 def get_pool_safe():
     from .db import get_pool
     return get_pool()
@@ -170,6 +213,9 @@ async def internal_shutdown(token: str = Query(...)):
     worker = getattr(app.state, "worker", None)
     if worker is not None:
         await worker.stop()
+    delivery = getattr(app.state, "delivery_worker", None)
+    if delivery is not None:
+        await delivery.stop()
     await close_pool()
     try:
         os.kill(os.getpid(), signal.SIGTERM)

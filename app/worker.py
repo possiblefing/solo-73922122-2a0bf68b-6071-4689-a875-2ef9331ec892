@@ -29,6 +29,7 @@ import asyncpg
 
 from .config import settings
 from .csvutil import median_nm
+from .delivery import enqueue_batch
 
 log = logging.getLogger("fab.worker")
 
@@ -292,6 +293,20 @@ class DecisionWorker:
                 """,
                 device_id, accept_seq, new_refs,
             )
+            # Best-effort outbox write in the same transaction: for a released
+            # batch the delivery row becomes visible exactly when the decision
+            # does.  Delivery itself happens later, in its own connections, so
+            # it can never block or roll back the decision.  The enqueue runs
+            # in a savepoint: even an unexpected failure (which aborts a
+            # PostgreSQL transaction) leaves the decision intact, and the
+            # reconciler creates the missing row later.
+            if status == "RELEASED":
+                try:
+                    async with conn.transaction():
+                        await enqueue_batch(conn, batch_id)
+                except Exception:  # pragma: no cover - defensive
+                    log.exception("could not enqueue batch id=%d for delivery; "
+                                  "the reconciler will retry", batch_id)
             log.info(
                 "[%s] decided batch id=%d (%s/%s) median=%.2f ref_mean=%s dev=%s "
                 "refs=%s -> %s (%s)",

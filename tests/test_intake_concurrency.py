@@ -48,7 +48,7 @@ async def test_many_concurrent_same_device_intakes_no_deadlock(
     pool = await create_pool()
     try:
         async with pool.acquire() as conn:
-            await conn.execute("TRUNCATE wafer_measurements, batches, device_state")
+            await conn.execute("TRUNCATE wafer_measurements, batches, device_state, delivery_outbox")
             await conn.execute("ALTER SEQUENCE batches_id_seq RESTART WITH 1")
 
         worker = DecisionWorker(pool, "w-starve")
@@ -100,7 +100,7 @@ async def test_concurrent_intakes_across_two_devices(tmp_path, monkeypatch):
     pool = await create_pool()
     try:
         async with pool.acquire() as conn:
-            await conn.execute("TRUNCATE wafer_measurements, batches, device_state")
+            await conn.execute("TRUNCATE wafer_measurements, batches, device_state, delivery_outbox")
             await conn.execute("ALTER SEQUENCE batches_id_seq RESTART WITH 1")
         coros = []
         for i in range(10):

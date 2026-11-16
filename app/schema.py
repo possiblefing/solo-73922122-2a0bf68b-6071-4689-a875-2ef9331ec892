@@ -60,6 +60,47 @@ CREATE TABLE IF NOT EXISTS device_state (
     ref_batch_ids    JSONB  NOT NULL DEFAULT '[]'::jsonb,
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Delivery outbox: one row per released batch that must be shipped to the
+-- analysis receiver.  Rows are created for *released* batches only -- either
+-- inside the decision transaction (best effort new batches) or by the
+-- reconciler, which also backfills batches released before this feature was
+-- deployed.  The original decision lives in ``batches`` and is never modified
+-- by delivery, so a delivery failure cannot change a release/quarantine
+-- verdict.
+--
+-- ``batch_no`` is the natural key (immutable, globally unique).  Concurrency
+-- between two source instances is handled by a lease: a claim is an atomic
+-- ``UPDATE ... FROM (SELECT ... FOR UPDATE SKIP LOCKED)``.  ``DELIVERED`` is
+-- only ever set after a 2xx response carrying a valid receipt; anything else
+-- stays retryable with exponential backoff.
+--
+-- No foreign key to ``batches`` is used so operational resets that truncate
+-- the decision tables keep working; the reconciler re-creates missing rows.
+CREATE TABLE IF NOT EXISTS delivery_outbox (
+    batch_no        TEXT PRIMARY KEY,
+    batch_id        BIGINT      NOT NULL,
+    device_id       TEXT        NOT NULL,
+    accept_seq      BIGINT      NOT NULL,
+    payload         JSONB       NOT NULL,
+    content_sha256  TEXT        NOT NULL,
+    status          TEXT        NOT NULL DEFAULT 'PENDING'
+                    CHECK (status IN ('PENDING','IN_FLIGHT','DELIVERED','REJECTED')),
+    attempts        INTEGER     NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    lease_owner     TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    receipt         JSONB,
+    delivered_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_delivery_due
+    ON delivery_outbox (status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_delivery_device_seq
+    ON delivery_outbox (device_id, accept_seq);
 """
 
 

@@ -57,7 +57,7 @@ async def _sql(query: str):
 @pytest.mark.asyncio
 async def test_crashed_worker_is_taken_over_by_survivor(tmp_path):
     # Fresh schema contents for an isolated story.
-    await _sql("TRUNCATE wafer_measurements, batches, device_state")
+    await _sql("TRUNCATE wafer_measurements, batches, device_state, delivery_outbox")
     await _sql("ALTER SEQUENCE batches_id_seq RESTART WITH 1")
     os.makedirs(BASE_ENV["STORAGE_DIR"], exist_ok=True)
 

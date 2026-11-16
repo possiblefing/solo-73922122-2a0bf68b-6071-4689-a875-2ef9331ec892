@@ -10,6 +10,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY app ./app
+COPY receiver ./receiver
 COPY scripts ./scripts
 
 # STORAGE_DIR is mounted as a named volume shared by both instances.
